@@ -12,7 +12,9 @@ import {
   AccessModel,
   WaiverPolicy,
   OpenAlexPaper,
+  SubmissionGuidelines,
 } from './src/data/journals.ts';
+import { regionForCountry } from './src/lib/format.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -55,139 +57,173 @@ function normalizeTier(raw?: string): JournalTier {
   if (val.includes('Q2') || val === '2') return 'Q2';
   if (val.includes('Q3') || val === '3') return 'Q3';
   if (val.includes('Q4') || val === '4') return 'Q4';
-  return 'Q2';
+  return 'NR'; // not ranked / not reported: never guess a quartile
 }
 
-function normalizeAccessModel(raw?: string, apcUsd = 0): AccessModel {
+function normalizeAccessModel(raw?: string, apcUsd: number | null = null): AccessModel {
   const val = String(raw || '').trim().toLowerCase();
-  if (val.includes('diamond') || (apcUsd === 0 && !val.includes('hybrid') && !val.includes('sub'))) {
-    return 'Diamond OA';
-  }
+  if (val.includes('diamond')) return 'Diamond OA';
   if (val.includes('hybrid')) return 'Hybrid';
   if (val.includes('sub')) return 'Subscription';
+  if (val.includes('gold') || val.includes('open')) return 'Gold OA';
+  if (apcUsd === 0) return 'Diamond OA';
   return 'Gold OA';
 }
 
-function normalizeWaiverPolicy(raw?: string, apcUsd = 0, accessModel?: AccessModel): WaiverPolicy {
-  const val = String(raw || '').trim().toLowerCase();
-  if (apcUsd === 0 || val.includes('100% free') || val.includes('no apc') || accessModel === 'Diamond OA') {
-    return '100% Free (No APC)';
-  }
-  if (accessModel === 'Hybrid' || val.includes('subscription')) {
-    return 'Standard Subscription (Zero OA Fee)';
-  }
-  if (val.includes('hinari') || val.includes('research4life') || val.includes('full')) {
-    return 'Full HINARI / Research4Life A&B Waiver';
-  }
-  if (val.includes('50%') || val.includes('discount')) {
-    return '50% LMIC Discount';
-  }
-  return 'Case-by-Case Institutional Waiver';
+/** Keeps the waiver / discount text as supplied. Only a known $0 APC is labelled free. */
+function normalizeWaiverPolicy(raw: string | undefined, apcUsd: number | null, accessModel: AccessModel): WaiverPolicy {
+  const val = String(raw || '').trim();
+  if (val) return val;
+  if (apcUsd === 0 || accessModel === 'Diamond OA') return '100% Free (No APC)';
+  return '';
 }
 
-function buildNormalizedJournal(body: Partial<HealthJournal>, indexOffset = 0): HealthJournal {
-  const title = (body.title || 'Untitled Health Journal').trim();
+/** A finite, non-negative number, or null when missing / unparseable. Zero only counts when allowZero is set. */
+function numOrNull(v: unknown, allowZero = false): number | null {
+  if (v === null || v === undefined || v === '') return null;
+  const n = Number(v);
+  if (!Number.isFinite(n) || n < 0) return null;
+  if (n === 0 && !allowZero) return null;
+  return n;
+}
+
+function cleanString(v: unknown): string {
+  return v === null || v === undefined ? '' : String(v).trim();
+}
+
+/** Drops null / empty values so a merge never overwrites known data with "unknown". */
+function withoutEmpty<T extends Record<string, unknown>>(obj: T | undefined): Partial<T> {
+  if (!obj) return {};
+  return Object.fromEntries(
+    Object.entries(obj).filter(
+      ([, v]) => v !== null && v !== undefined && v !== '' && !(Array.isArray(v) && v.length === 0)
+    )
+  ) as Partial<T>;
+}
+
+// Journal-specific guideline fields default to null ("not recorded"), never to invented values.
+// Only the generic good-practice checklists have defaults.
+const UNKNOWN_GUIDELINES: SubmissionGuidelines = {
+  reportingStandards: [],
+  wordLimitAbstract: null,
+  wordLimitMainText: null,
+  maxReferences: null,
+  maxTablesFigures: null,
+  referenceStyle: null,
+  blindingPolicy: null,
+  ethicsRequirements: [
+    'Ethics committee approval number and informed consent statement (check the journal\'s own policy)',
+  ],
+  dataSharingPolicy: null,
+  coverLetterChecklist: [
+    'Summarize the public health significance and novelty of the work',
+    'Confirm all authors approved the submission and declare competing interests',
+  ],
+  preprintPolicy: null,
+  authorPortalUrl: '',
+};
+
+type IncomingJournal = Omit<Partial<HealthJournal>, 'guidelines'> & { guidelines?: Partial<SubmissionGuidelines> };
+
+function buildNormalizedJournal(body: IncomingJournal, indexOffset = 0): HealthJournal {
+  const title = cleanString(body.title) || 'Untitled Health Journal';
   const slug = title
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/(^-|-$)/g, '')
     .slice(0, 36);
-  const id = body.id?.trim() || `${slug || 'journal'}-${Date.now()}-${indexOffset}`;
+  const id = cleanString(body.id) || `${slug || 'journal'}-${Date.now()}-${indexOffset}`;
   const tier = normalizeTier(body.tier);
-  const jif = Number.isFinite(Number(body.impactFactor)) && Number(body.impactFactor) >= 0 ? Number(body.impactFactor) : 1.8;
-  const citeScore =
-    Number.isFinite(Number(body.citeScore)) && Number(body.citeScore) >= 0
-      ? Number(body.citeScore)
-      : Number((jif * 1.7).toFixed(1));
-  const apcUsd = Number.isFinite(Number(body.apcUsd)) && Number(body.apcUsd) >= 0 ? Number(body.apcUsd) : 0;
+  const apcUsd = numOrNull(body.apcUsd, true);
   const accessModel = normalizeAccessModel(body.accessModel, apcUsd);
   const waiverPolicy = normalizeWaiverPolicy(body.waiverPolicy, apcUsd, accessModel);
-  const subjectPrimary = body.subjectPrimary?.trim() || 'Public, Environmental & Occupational Health';
-  const country = body.country?.trim() || 'Global / Multilateral';
+
+  // "1234-5678, 8765-4321" in one ISSN cell -> issn + eissn
+  const issnParts = cleanString(body.issn).split(/[,;]/).map((x) => x.trim()).filter(Boolean);
+  const issn = issnParts[0] || '';
+  const eissn = cleanString(body.eissn) || issnParts[1] || issn;
+
+  const subjectParts = cleanString(body.subjectPrimary).split(';').map((x) => x.trim()).filter(Boolean);
+  const subjectPrimary = subjectParts[0] || 'Unclassified';
+  const subjects =
+    Array.isArray(body.subjects) && body.subjects.length > 0 ? body.subjects : subjectParts.length ? subjectParts : [subjectPrimary];
+  const country = cleanString(body.country);
 
   return {
     id,
     title,
-    abbreviation: body.abbreviation?.trim() || title.slice(0, 28),
-    issn: body.issn?.trim() || '2049-3630',
-    eissn: body.eissn?.trim() || body.issn?.trim() || '2049-3630',
-    publisher: body.publisher?.trim() || 'International Academic Press',
+    abbreviation: cleanString(body.abbreviation),
+    issn,
+    eissn,
+    publisher: cleanString(body.publisher),
     tier,
-    sjrScore:
-      Number.isFinite(Number(body.sjrScore)) && Number(body.sjrScore) > 0
-        ? Number(body.sjrScore)
-        : Number((jif * 0.42).toFixed(2)),
-    impactFactor: jif,
-    fiveYearImpactFactor:
-      Number.isFinite(Number(body.fiveYearImpactFactor)) && Number(body.fiveYearImpactFactor) > 0
-        ? Number(body.fiveYearImpactFactor)
-        : Number((jif * 1.2).toFixed(1)),
-    citeScore,
-    hIndex: Number.isFinite(Number(body.hIndex)) && Number(body.hIndex) > 0 ? Number(body.hIndex) : 48,
+    sjrScore: numOrNull(body.sjrScore),
+    impactFactor: numOrNull(body.impactFactor),
+    fiveYearImpactFactor: numOrNull(body.fiveYearImpactFactor),
+    citeScore: numOrNull(body.citeScore),
+    hIndex: numOrNull(body.hIndex),
     apcUsd,
     accessModel,
     waiverPolicy,
     subjectPrimary,
-    subjects:
-      Array.isArray(body.subjects) && body.subjects.length > 0
-        ? body.subjects
-        : [subjectPrimary],
+    subjects,
     country,
-    region: body.region || 'Global / Multilateral',
-    indexing:
-      Array.isArray(body.indexing) && body.indexing.length > 0
-        ? body.indexing
-        : ['Scopus', 'MEDLINE', 'DOAJ'],
-    acceptanceRatePct:
-      Number.isFinite(Number(body.acceptanceRatePct)) && Number(body.acceptanceRatePct) > 0
-        ? Number(body.acceptanceRatePct)
-        : 28,
-    firstDecisionDays:
-      Number.isFinite(Number(body.firstDecisionDays)) && Number(body.firstDecisionDays) > 0
-        ? Number(body.firstDecisionDays)
-        : 30,
-    publicationTimeDays:
-      Number.isFinite(Number(body.publicationTimeDays)) && Number(body.publicationTimeDays) > 0
-        ? Number(body.publicationTimeDays)
-        : 75,
-    scopeSummary:
-      body.scopeSummary?.trim() ||
-      `Publishes peer-reviewed international research in ${subjectPrimary.toLowerCase()} and health policy.`,
-    keyTopics:
-      Array.isArray(body.keyTopics) && body.keyTopics.length > 0
-        ? body.keyTopics
-        : [subjectPrimary, 'Public Health', 'Epidemiology'],
-    impactHistory:
-      Array.isArray(body.impactHistory) && body.impactHistory.length === 5
-        ? body.impactHistory
-        : [
-            { year: 2021, jif: Number((jif * 0.85).toFixed(1)), citeScore: Number((citeScore * 0.85).toFixed(1)) },
-            { year: 2022, jif: Number((jif * 1.15).toFixed(1)), citeScore: Number((citeScore * 1.1).toFixed(1)) },
-            { year: 2023, jif: Number((jif * 1.08).toFixed(1)), citeScore: Number((citeScore * 1.05).toFixed(1)) },
-            { year: 2024, jif: Number((jif * 1.02).toFixed(1)), citeScore: Number((citeScore * 1.01).toFixed(1)) },
-            { year: 2025, jif, citeScore },
-          ],
-    guidelines: body.guidelines || {
-      reportingStandards: ['STROBE', 'CONSORT', 'PRISMA'],
-      wordLimitAbstract: 250,
-      wordLimitMainText: '3,500 words (Original Research)',
-      maxReferences: 40,
-      maxTablesFigures: 5,
-      referenceStyle: 'Vancouver (Numbered)',
-      blindingPolicy: 'Double-Blind',
-      ethicsRequirements: [
-        'Institutional Review Board (IRB) or National Ethics Committee approval number required',
-        'Informed consent declaration in Methods section',
-      ],
-      dataSharingPolicy: 'Data Availability Statement required prior to references.',
-      coverLetterChecklist: [
-        'Summarize public health significance and novelty',
-        'Confirm all authors approved the submission and declare conflicts of interest',
-      ],
-      preprintPolicy: 'Permits preprint submissions on medRxiv and bioRxiv.',
-      authorPortalUrl: 'https://www.equator-network.org/',
-    },
+    region: body.region && body.region !== 'Global / Multilateral' ? body.region : regionForCountry(country),
+    indexing: Array.isArray(body.indexing) ? body.indexing : [],
+    acceptanceRatePct: numOrNull(body.acceptanceRatePct),
+    firstDecisionDays: numOrNull(body.firstDecisionDays),
+    publicationTimeDays: numOrNull(body.publicationTimeDays),
+    scopeSummary: cleanString(body.scopeSummary),
+    keyTopics: Array.isArray(body.keyTopics) && body.keyTopics.length > 0 ? body.keyTopics : subjects,
+    impactHistory: Array.isArray(body.impactHistory) ? body.impactHistory : [],
+    guidelines: { ...UNKNOWN_GUIDELINES, ...withoutEmpty(body.guidelines as Record<string, unknown>) } as SubmissionGuidelines,
   };
+}
+
+function nr(v: number | null | undefined, suffix = ''): string {
+  return v === null || v === undefined ? 'not reported' : `${v}${suffix}`;
+}
+
+const MATCHER_MAX_CANDIDATES = 120;
+
+/**
+ * Narrows a large catalog to the most relevant candidates before it is sent to Gemini,
+ * so the prompt stays small even with thousands of journals.
+ * Hard constraints first (tier, known APC within budget, waiver route), then keyword overlap.
+ */
+function shortlistForMatcher(
+  journals: HealthJournal[],
+  opts: { text: string; maxApcUsd: number; preferredTiers: string[]; requireWaiverOrZeroApc: boolean }
+): HealthJournal[] {
+  if (journals.length <= MATCHER_MAX_CANDIDATES) return journals;
+  const stop = new Set(['the', 'and', 'for', 'with', 'from', 'that', 'this', 'among', 'study', 'using', 'based', 'between', 'into', 'were', 'was', 'are', 'its', 'their', 'our', 'in', 'of', 'on', 'to', 'a', 'an']);
+  const terms = Array.from(
+    new Set(
+      opts.text
+        .toLowerCase()
+        .split(/[^a-z0-9]+/)
+        .filter((t) => t.length > 3 && !stop.has(t))
+    )
+  );
+  const pool = journals.filter((j) => {
+    if (opts.preferredTiers.length && !opts.preferredTiers.includes(j.tier)) return false;
+    if (j.apcUsd !== null && j.apcUsd > opts.maxApcUsd && j.accessModel !== 'Hybrid' && j.accessModel !== 'Subscription') return false;
+    if (opts.requireWaiverOrZeroApc) {
+      const w = (j.waiverPolicy || '').toLowerCase();
+      const free = j.apcUsd === 0 || j.accessModel === 'Diamond OA' || j.accessModel === 'Hybrid';
+      if (!free && !/\byes\b|agreement|read-and-publish|hinari|50% lmic|case-by-case|subsidi[sz]ed/.test(w)) return false;
+    }
+    return true;
+  });
+  const tierBonus: Record<string, number> = { Q1: 0.4, Q2: 0.3, Q3: 0.2, Q4: 0.1, NR: 0 };
+  const scored = pool.map((j) => {
+    const hay = `${j.title} ${j.subjectPrimary} ${j.subjects.join(' ')} ${j.scopeSummary} ${j.keyTopics.join(' ')}`.toLowerCase();
+    let score = 0;
+    for (const t of terms) if (hay.includes(t)) score += 1;
+    return { j, score: score + (tierBonus[j.tier] ?? 0) };
+  });
+  scored.sort((a, b) => b.score - a.score);
+  return scored.slice(0, MATCHER_MAX_CANDIDATES).map((x) => x.j);
 }
 
 function getGenAIClient(): GoogleGenAI {
@@ -217,7 +253,7 @@ async function startServer() {
   // 2. Add a single custom or regional journal to the active catalog
   app.post('/api/journals', (req, res) => {
     try {
-      const body = req.body as Partial<HealthJournal>;
+      const body = req.body as IncomingJournal;
       if (!body.title || !body.tier || !body.country || !body.subjectPrimary) {
         res.status(400).json({ error: 'Title, Tier, Country, and Primary Subject are required.' });
         return;
@@ -236,9 +272,10 @@ async function startServer() {
   // 2b. Bulk import / update journal database from uploaded XLS, XLSX, or CSV parsed records
   app.post('/api/journals/bulk', (req, res) => {
     try {
-      const { journals: incomingRows, mode = 'merge' } = req.body as {
-        journals?: Array<Partial<HealthJournal>>;
+      const { journals: incomingRows, mode = 'merge', offset = 0 } = req.body as {
+        journals?: IncomingJournal[];
         mode?: 'merge' | 'replace';
+        offset?: number;
       };
 
       if (!Array.isArray(incomingRows) || incomingRows.length === 0) {
@@ -252,7 +289,7 @@ async function startServer() {
       if (mode === 'replace') {
         const normalizedList = incomingRows
           .filter((r) => r && r.title && String(r.title).trim().length > 0)
-          .map((row, idx) => buildNormalizedJournal(row, idx));
+          .map((row, idx) => buildNormalizedJournal(row, offset + idx));
 
         if (normalizedList.length === 0) {
           res.status(400).json({ error: 'Uploaded file did not contain any rows with a valid journal title.' });
@@ -268,35 +305,38 @@ async function startServer() {
         incomingRows.forEach((row, idx) => {
           if (!row || !row.title || !String(row.title).trim()) return;
           const cleanTitle = String(row.title).trim().toLowerCase();
-          const cleanIssn = row.issn ? String(row.issn).trim().toLowerCase() : '';
+          const cleanIssns = String(row.issn || '')
+            .split(/[,;]/)
+            .map((x) => x.trim().toLowerCase())
+            .filter(Boolean);
 
           const existingIdx = updatedCatalog.findIndex((existing) => {
             const titleMatch = existing.title.trim().toLowerCase() === cleanTitle;
-            const issnMatch =
-              cleanIssn &&
-              cleanIssn !== '2049-3630' &&
-              (existing.issn.toLowerCase() === cleanIssn || existing.eissn.toLowerCase() === cleanIssn);
+            const issnMatch = cleanIssns.some(
+              (x) => x === (existing.issn || '').toLowerCase() || x === (existing.eissn || '').toLowerCase()
+            );
             return titleMatch || Boolean(issnMatch);
           });
 
           if (existingIdx !== -1) {
             const current = updatedCatalog[existingIdx];
+            // Only values present in the upload overwrite; blanks keep what is already stored.
             const merged = buildNormalizedJournal(
               {
                 ...current,
-                ...row,
+                ...withoutEmpty(row as Record<string, unknown>),
                 id: current.id,
                 guidelines: {
                   ...current.guidelines,
-                  ...(row.guidelines || {}),
+                  ...withoutEmpty(row.guidelines as Record<string, unknown>),
                 },
               },
-              idx
+              offset + idx
             );
             updatedCatalog[existingIdx] = merged;
             updatedCount++;
           } else {
-            const created = buildNormalizedJournal(row, idx);
+            const created = buildNormalizedJournal(row, offset + idx);
             updatedCatalog.unshift(created);
             addedCount++;
           }
@@ -423,7 +463,12 @@ async function startServer() {
       }
 
       const ai = getGenAIClient();
-      const allJournals = getAllJournals();
+      const allJournals = shortlistForMatcher(getAllJournals(), {
+        text: `${title} ${keywords} ${abstract}`,
+        maxApcUsd,
+        preferredTiers,
+        requireWaiverOrZeroApc,
+      });
 
       // Filter candidate pool or pass full catalog with constraints noted
       const catalogContext = allJournals.map((j) => ({
@@ -456,7 +501,7 @@ RESEARCHER CONSTRAINTS:
 - Preferred Quartile Tiers: ${preferredTiers.join(', ')}
 - Requires LMIC Waiver or $0 Diamond OA / Hybrid: ${requireWaiverOrZeroApc ? 'YES (Prioritize $0 APC, Hybrid, or Full HINARI/Research4Life Waiver journals)' : 'No strict waiver requirement'}
 
-AVAILABLE JOURNAL CATALOG (Use exact journalId values from this list):
+AVAILABLE JOURNAL CATALOG (Use exact journalId values from this list; null means the value is not reported — do not assume or invent it):
 ${JSON.stringify(catalogContext, null, 2)}
 
 Provide a rigorous, constructive epidemiological and editorial assessment. Ensure all recommended journalId values exist in the catalog above.`;
@@ -580,10 +625,11 @@ Perform an automated Impact Factor & Citation Trajectory analysis for the follow
 JOURNAL PROFILE:
 - Title: ${journal.title} (${journal.abbreviation})
 - Publisher: ${journal.publisher} (${journal.country})
-- Quartile Tier: ${journal.tier} | SJR: ${journal.sjrScore} | JIF: ${journal.impactFactor} | 5-Year JIF: ${journal.fiveYearImpactFactor} | CiteScore: ${journal.citeScore} | H-Index: ${journal.hIndex}
-- APC: $${journal.apcUsd} USD (${journal.accessModel} — ${journal.waiverPolicy})
-- Acceptance Rate: ${journal.acceptanceRatePct}% | First Decision: ${journal.firstDecisionDays} days | Total Publication Time: ${journal.publicationTimeDays} days
-- 5-Year Impact History (2021-2025): ${JSON.stringify(journal.impactHistory)}
+- Quartile Tier: ${journal.tier} | SJR: ${nr(journal.sjrScore)} | JIF: ${nr(journal.impactFactor)} | 5-Year JIF: ${nr(journal.fiveYearImpactFactor)} | CiteScore: ${nr(journal.citeScore)} | H-Index: ${nr(journal.hIndex)}
+- APC: ${journal.apcUsd === null ? 'not reported' : `$${journal.apcUsd} USD`} (${journal.accessModel} — ${journal.waiverPolicy || 'waiver policy not reported'})
+- Acceptance Rate: ${nr(journal.acceptanceRatePct, '%')} | First Decision: ${nr(journal.firstDecisionDays, ' days')} | Total Publication Time: ${nr(journal.publicationTimeDays, ' days')}
+- 5-Year Impact History (2021-2025): ${journal.impactHistory.length ? JSON.stringify(journal.impactHistory) : 'not reported'}
+(Values marked "not reported" are unknown. Do not estimate or invent them.)
 - Scope: ${journal.scopeSummary}
 - Submission Guidelines: ${JSON.stringify(journal.guidelines)}
 ${researcherContext ? `- Researcher Target Context: ${researcherContext}` : ''}
