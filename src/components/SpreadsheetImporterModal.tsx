@@ -12,12 +12,11 @@ import {
 } from 'lucide-react';
 import { HealthJournal, JournalTier, AccessModel, SubmissionGuidelines } from '../data/journals';
 import { fmtNum, fmtApc } from '../lib/format';
+import { buildNormalizedJournal, catalogRowId, loadCatalogFile, mergeIntoCatalog } from '../lib/normalize';
 
 // A parsed spreadsheet row. Unknown values stay null/empty: nothing is invented here or on the server.
 export type ImportRow = Omit<Partial<HealthJournal>, 'guidelines'> & { guidelines?: Partial<SubmissionGuidelines> };
 
-// Rows per request. Keeps each upload well under the server's body-size limit.
-const IMPORT_BATCH_SIZE = 250;
 
 interface SpreadsheetImporterModalProps {
   isOpen: boolean;
@@ -231,11 +230,9 @@ export default function SpreadsheetImporterModal({
   const [parsedRows, setParsedRows] = useState<ImportRow[]>([]);
   const [importMode, setImportMode] = useState<'merge' | 'replace'>('merge');
   const [parseError, setParseError] = useState<string | null>(null);
-  const [isApplying, setIsApplying] = useState<boolean>(false);
   const [isResetting, setIsResetting] = useState<boolean>(false);
   const [isDragging, setIsDragging] = useState<boolean>(false);
-  const [importProgress, setImportProgress] = useState<{ done: number; total: number } | null>(null);
-
+  
   if (!isOpen) return null;
 
   const extractRowsFromSheet = (wb: XLSX.WorkBook, sheetName: string) => {
@@ -394,84 +391,61 @@ export default function SpreadsheetImporterModal({
     );
   };
 
-  const handleCommitDatabaseUpdate = async () => {
+  // Applies the spreadsheet in this browser. The live site is static (no server), so this lasts
+  // until the page is reloaded. "Download catalog.json" makes it permanent.
+  const handleCommitDatabaseUpdate = () => {
     if (parsedRows.length === 0) return;
-    setIsApplying(true);
     setParseError(null);
-    const total = parsedRows.length;
-    let addedCount = 0;
-    let updatedCount = 0;
-    let lastData: any = null;
-    let done = 0;
-    try {
-      // Upload in batches so a large file never exceeds the server's request-size limit.
-      // In "replace" mode only the first batch replaces the catalog; later batches are merged into it.
-      for (let start = 0; start < total; start += IMPORT_BATCH_SIZE) {
-        const batch = parsedRows.slice(start, start + IMPORT_BATCH_SIZE);
-        setImportProgress({ done, total });
-        const response = await fetch('/api/journals/bulk', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            journals: batch,
-            mode: importMode === 'replace' && start === 0 ? 'replace' : 'merge',
-            offset: start,
-          }),
-        });
-        const data = await readJsonSafely(response);
-        if (!response.ok || !data || !Array.isArray(data.journals)) {
-          const reason =
-            data?.error ||
-            (response.status === 413
-              ? 'the batch was too large for the server (HTTP 413)'
-              : `the server returned an unexpected response (HTTP ${response.status})`);
-          throw new Error(
-            `Import stopped at rows ${start + 1}–${start + batch.length}: ${reason}.` +
-              (done > 0 ? ` The first ${done} rows were already saved.` : ' Nothing was saved.')
-          );
-        }
-        addedCount += data.summary?.addedCount ?? 0;
-        updatedCount += data.summary?.updatedCount ?? 0;
-        done += batch.length;
-        lastData = data;
-      }
-      onDatabaseUpdated(lastData.journals, {
-        mode: importMode,
-        addedCount,
-        updatedCount,
-        totalCount: lastData.summary?.totalCount ?? lastData.journals.length,
+    if (importMode === 'replace') {
+      const journals = parsedRows.map((row, i) =>
+        buildNormalizedJournal({ ...row, id: catalogRowId(String(row.title), i) }, i)
+      );
+      onDatabaseUpdated(journals, { mode: 'replace', addedCount: journals.length, updatedCount: 0, totalCount: journals.length });
+    } else {
+      const merged = mergeIntoCatalog(existingJournals, parsedRows);
+      onDatabaseUpdated(merged.journals, {
+        mode: 'merge',
+        addedCount: merged.addedCount,
+        updatedCount: merged.updatedCount,
+        totalCount: merged.journals.length,
       });
-      onClose();
-    } catch (err) {
-      setParseError(err instanceof Error ? err.message : 'Error updating database on server.');
-    } finally {
-      setIsApplying(false);
-      setImportProgress(null);
     }
+    onClose();
   };
 
+  /**
+   * Downloads the catalog file to upload to GitHub as public/catalog.json.
+   * Replace mode: the file holds exactly the spreadsheet's journals.
+   * Merge mode: the file holds the current catalog with the spreadsheet merged in.
+   */
+  const handleDownloadCatalogFile = () => {
+    if (parsedRows.length === 0) return;
+    const rows: Array<Record<string, unknown>> =
+      importMode === 'replace'
+        ? parsedRows.map((row, i) => ({ id: catalogRowId(String(row.title), i), ...row }))
+        : mergeIntoCatalog(existingJournals, parsedRows).journals.map((j, i) => ({ ...j, id: catalogRowId(j.title, i) }));
+    const blob = new Blob([JSON.stringify(rows)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'catalog.json';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  };
+
+  // Discards changes made in this browser and reloads the saved catalog file (/catalog.json).
   const handleResetDefaultCatalog = async () => {
     setIsResetting(true);
     setParseError(null);
     try {
-      const response = await fetch('/api/journals/reset', {
-        method: 'POST',
-      });
-      const data = await readJsonSafely(response);
-      if (!response.ok || !data) {
-        throw new Error(data?.error || `Reset failed (HTTP ${response.status}).`);
-      }
-      if (data.journals) {
-        onDatabaseUpdated(data.journals, {
-          mode: 'replace',
-          addedCount: data.journals.length,
-          updatedCount: 0,
-          totalCount: data.journals.length,
-        });
-        onClose();
-      }
+      const catalog = await loadCatalogFile();
+      if (!catalog) throw new Error('Could not load the saved catalog file (/catalog.json).');
+      onDatabaseUpdated(catalog, { mode: 'replace', addedCount: catalog.length, updatedCount: 0, totalCount: catalog.length });
+      onClose();
     } catch (err) {
-      setParseError(err instanceof Error ? err.message : 'Failed to reset database.');
+      setParseError(err instanceof Error ? err.message : 'Failed to reload the saved catalog.');
     } finally {
       setIsResetting(false);
     }
@@ -550,7 +524,7 @@ export default function SpreadsheetImporterModal({
             className="inline-flex items-center gap-1 text-slate-500 hover:text-slate-800 dark:hover:text-slate-200 transition-colors"
           >
             <RotateCcw className="w-3.5 h-3.5" />
-            {isResetting ? 'Restoring...' : 'Restore Default Seed Catalog'}
+            {isResetting ? 'Reloading...' : 'Reload Saved Catalog'}
           </button>
         </div>
 
@@ -711,9 +685,11 @@ export default function SpreadsheetImporterModal({
         )}
 
         {/* Footer Actions */}
-        <div className="pt-3 border-t border-slate-200 dark:border-slate-800 flex items-center justify-between gap-3">
-          <div className="text-xs text-slate-500">
-            All imported journals become immediately searchable and available to the Gemini Manuscript Matcher.
+        <div className="pt-3 border-t border-slate-200 dark:border-slate-800 flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+          <div className="text-xs text-slate-500 max-w-md">
+            <strong>Preview</strong> applies the spreadsheet in this browser until you reload. To make it{' '}
+            <strong>permanent</strong>, download <span className="font-mono">catalog.json</span> and upload it to GitHub
+            as <span className="font-mono">public/catalog.json</span> (replacing the old one). Vercel redeploys in about a minute.
           </div>
           <div className="flex items-center gap-2.5">
             <button
@@ -725,25 +701,21 @@ export default function SpreadsheetImporterModal({
             </button>
             <button
               type="button"
-              disabled={parsedRows.length === 0 || isApplying}
+              disabled={parsedRows.length === 0}
               onClick={handleCommitDatabaseUpdate}
+              className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-teal-800 dark:text-teal-300 bg-teal-50 dark:bg-teal-950/40 hover:bg-teal-100 disabled:opacity-50 rounded-lg transition-colors"
+            >
+              <Upload className="w-3.5 h-3.5" />
+              {importMode === 'merge' ? `Preview Merge (${parsedRows.length} rows)` : `Preview Replace (${parsedRows.length} rows)`}
+            </button>
+            <button
+              type="button"
+              disabled={parsedRows.length === 0}
+              onClick={handleDownloadCatalogFile}
               className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-teal-800 hover:bg-teal-900 disabled:opacity-50 rounded-lg transition-colors"
             >
-              {isApplying ? (
-                <>
-                  <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                  {importProgress
-                    ? `Saving ${Math.min(importProgress.done + IMPORT_BATCH_SIZE, importProgress.total)} of ${importProgress.total}...`
-                    : 'Updating Database...'}
-                </>
-              ) : (
-                <>
-                  <Upload className="w-3.5 h-3.5" />
-                  {importMode === 'merge'
-                    ? `Merge & Update Database (${parsedRows.length} rows)`
-                    : `Replace Database (${parsedRows.length} rows)`}
-                </>
-              )}
+              <Download className="w-3.5 h-3.5" />
+              Download catalog.json
             </button>
           </div>
         </div>
