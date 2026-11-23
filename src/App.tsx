@@ -37,6 +37,8 @@ import {
 } from './data/journals';
 import SpreadsheetImporterModal from './components/SpreadsheetImporterModal';
 import { DASH, fmtNum, fmtInt, fmtApc, isKnown, compareNullable, hasWaiverRoute } from './lib/format';
+import { buildNormalizedJournal, catalogRowId, loadCatalogFile } from './lib/normalize';
+
 
 type WorkspaceTab = 'explorer' | 'matcher' | 'impact' | 'guidelines';
 
@@ -152,18 +154,11 @@ export default function App() {
     }
   }, [darkMode]);
 
-  // Fetch server catalog on load
+  // Load the permanent catalog file (public/catalog.json) on page load
   useEffect(() => {
-    fetch('/api/journals')
-      .then((r) => (r.ok ? r.json() : null))
-      .then((data) => {
-        if (data?.journals?.length) {
-          setJournals(data.journals);
-        }
-      })
-      .catch(() => {
-        // Fallback to static HEALTH_JOURNALS already loaded
-      });
+    loadCatalogFile().then((catalog) => {
+      if (catalog) setJournals(catalog);
+    });
   }, []);
 
   const selectedJournal = useMemo(() => {
@@ -393,32 +388,32 @@ export default function App() {
     if (!newJournalForm.title.trim()) return;
     setIsSavingJournal(true);
     try {
-      const response = await fetch('/api/journals', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+      const num = (v: string) => (v.trim() === '' ? null : Number(v));
+      // Added in the browser only (the live site has no server). To keep it, download the
+      // catalog file from the importer and upload it to GitHub as public/catalog.json.
+      const journal = buildNormalizedJournal(
+        {
+          id: catalogRowId(newJournalForm.title, Date.now()),
           title: newJournalForm.title,
           abbreviation: newJournalForm.abbreviation,
           issn: newJournalForm.issn,
           publisher: newJournalForm.publisher,
           tier: newJournalForm.tier,
-          impactFactor: newJournalForm.impactFactor.trim() === '' ? null : Number(newJournalForm.impactFactor),
-          citeScore: newJournalForm.citeScore.trim() === '' ? null : Number(newJournalForm.citeScore),
-          sjrScore: newJournalForm.sjrScore.trim() === '' ? null : Number(newJournalForm.sjrScore),
-          apcUsd: newJournalForm.apcUsd.trim() === '' ? null : Number(newJournalForm.apcUsd),
+          impactFactor: num(newJournalForm.impactFactor),
+          citeScore: num(newJournalForm.citeScore),
+          sjrScore: num(newJournalForm.sjrScore),
+          apcUsd: num(newJournalForm.apcUsd),
           subjectPrimary: newJournalForm.subjectPrimary,
           country: newJournalForm.country,
-          acceptanceRatePct: newJournalForm.acceptanceRatePct.trim() === '' ? null : Number(newJournalForm.acceptanceRatePct),
-          firstDecisionDays: newJournalForm.firstDecisionDays.trim() === '' ? null : Number(newJournalForm.firstDecisionDays),
+          acceptanceRatePct: num(newJournalForm.acceptanceRatePct),
+          firstDecisionDays: num(newJournalForm.firstDecisionDays),
           scopeSummary: newJournalForm.scopeSummary,
-        }),
-      });
-      const data = await response.json();
-      if (response.ok && data.journal) {
-        setJournals((prev) => [data.journal, ...prev]);
-        setSelectedJournalId(data.journal.id);
-        setShowAddModal(false);
-      }
+        },
+        0
+      );
+      setJournals((prev) => [journal, ...prev]);
+      setSelectedJournalId(journal.id);
+      setShowAddModal(false)
     } finally {
       setIsSavingJournal(false);
     }
@@ -661,10 +656,12 @@ export default function App() {
             <div className="flex items-center gap-2.5 text-slate-800 dark:text-slate-200">
               <Check className="w-4 h-4 text-teal-700 dark:text-teal-400 shrink-0" />
               <span>
-                <strong>Journal Database Updated via Spreadsheet:</strong>{' '}
+                <strong>Catalog updated in this browser:</strong>{' '}
                 {lastImportBanner.mode === 'replace'
                   ? `Replaced catalog with ${lastImportBanner.totalCount} imported journals.`
-                  : `Added ${lastImportBanner.addedCount} new journals and updated ${lastImportBanner.updatedCount} existing records (Total active catalog: ${lastImportBanner.totalCount} journals).`}
+                  : `Added ${lastImportBanner.addedCount} new journals and updated ${lastImportBanner.updatedCount} existing records (Total active catalog: ${lastImportBanner.totalCount} journals).`}{' '}
+                This is temporary until you reload. To keep it, use “Download catalog.json” in the importer and upload that
+                file to GitHub as <span className="font-mono">public/catalog.json</span>.
               </span>
             </div>
             <button
@@ -948,11 +945,13 @@ export default function App() {
                                 <span className="font-mono">{journal.issn}</span>
                                 <span aria-hidden="true">·</span>
                                 <span>{journal.publisher}</span>
-                                <span aria-hidden="true">·</span>
                                 {journal.indexing.length > 0 && (
-                                  <span className="text-slate-600 dark:text-slate-300">
-                                    {journal.indexing.join(' / ')}
-                                  </span>
+                                  <>
+                                    <span aria-hidden="true">·</span>
+                                    <span className="text-slate-600 dark:text-slate-300">
+                                      {journal.indexing.join(' / ')}
+                                    </span>
+                                  </>
                                 )}
                               </div>
                             </td>
