@@ -1,0 +1,6 @@
+{
+  "name": "GlobalHealth Journal Atlas & Matcher",
+  "description": "International health journal intelligence platform for filtering journals by quartile tier, APC, subject, and country, with AI-powered abstract matching, automated impact factor analysis, and global researcher submission guidelines.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
