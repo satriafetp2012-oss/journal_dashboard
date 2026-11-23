@@ -10,7 +10,14 @@ import {
   X,
   RotateCcw,
 } from 'lucide-react';
-import { HealthJournal, JournalTier, AccessModel, WaiverPolicy } from '../data/journals';
+import { HealthJournal, JournalTier, AccessModel, SubmissionGuidelines } from '../data/journals';
+import { fmtNum, fmtApc } from '../lib/format';
+
+// A parsed spreadsheet row. Unknown values stay null/empty: nothing is invented here or on the server.
+export type ImportRow = Omit<Partial<HealthJournal>, 'guidelines'> & { guidelines?: Partial<SubmissionGuidelines> };
+
+// Rows per request. Keeps each upload well under the server's body-size limit.
+const IMPORT_BATCH_SIZE = 250;
 
 interface SpreadsheetImporterModalProps {
   isOpen: boolean;
@@ -22,17 +29,32 @@ interface SpreadsheetImporterModalProps {
   ) => void;
 }
 
-function parseNumericField(raw: unknown, fallback: number): number {
-  if (raw === null || raw === undefined || raw === '') return fallback;
+/** Number from a cell, or null when the cell is empty, "-", "NA" or otherwise not a number. */
+function parseNumericField(raw: unknown): number | null {
+  if (raw === null || raw === undefined || raw === '') return null;
+  if (typeof raw === 'number') return Number.isFinite(raw) && raw >= 0 ? raw : null;
   const cleaned = String(raw)
-    .replace(/[$,€£%\s]/g, '')
-    .replace(/,/g, '.')
+    .replace(/[$€£%\s]/g, '')
+    .replace(/,/g, '')
     .trim();
-  if (cleaned.toLowerCase() === 'free' || cleaned.toLowerCase() === 'none' || cleaned === '-') {
-    return 0;
-  }
+  if (!cleaned) return null;
   const num = Number(cleaned);
-  return Number.isFinite(num) && num >= 0 ? num : fallback;
+  return Number.isFinite(num) && num >= 0 ? num : null;
+}
+
+/** APC: like parseNumericField, but words such as "free" / "no APC" mean 0. */
+function parseApcField(raw: unknown): number | null {
+  if (typeof raw === 'string' && /\bfree\b|no apc|^none$/i.test(raw.trim())) return 0;
+  return parseNumericField(raw);
+}
+
+function splitList(raw: unknown, separators = /[;|]/): string[] {
+  return raw === null || raw === undefined || raw === ''
+    ? []
+    : String(raw)
+        .split(separators)
+        .map((x) => x.trim())
+        .filter(Boolean);
 }
 
 function parseTierField(raw: unknown): JournalTier {
@@ -41,7 +63,7 @@ function parseTierField(raw: unknown): JournalTier {
   if (str.includes('Q2') || str === '2' || str.includes('TIER 2')) return 'Q2';
   if (str.includes('Q3') || str === '3' || str.includes('TIER 3')) return 'Q3';
   if (str.includes('Q4') || str === '4' || str.includes('TIER 4')) return 'Q4';
-  return 'Q2';
+  return 'NR'; // not ranked / not reported
 }
 
 function getColumnValue(row: Record<string, unknown>, aliases: string[]): unknown {
@@ -65,7 +87,7 @@ function getColumnValue(row: Record<string, unknown>, aliases: string[]): unknow
   return undefined;
 }
 
-function mapSpreadsheetRowToJournal(row: Record<string, unknown>): Partial<HealthJournal> | null {
+export function mapSpreadsheetRowToJournal(row: Record<string, unknown>): ImportRow | null {
   const rawTitle = getColumnValue(row, [
     'Title',
     'Journal Title',
@@ -80,161 +102,83 @@ function mapSpreadsheetRowToJournal(row: Record<string, unknown>): Partial<Healt
     return null;
   }
 
+  const str = (v: unknown) => (v === null || v === undefined ? '' : String(v).trim());
   const title = String(rawTitle).trim();
-  const abbreviation = String(
-    getColumnValue(row, ['Abbreviation', 'ISO Abbreviation', 'Abbr', 'Short Title']) || title.slice(0, 26)
-  ).trim();
-  const issn = String(
-    getColumnValue(row, ['ISSN', 'Print ISSN', 'p-ISSN', 'ISSN-L']) || '2049-3630'
-  ).trim();
-  const eissn = String(
-    getColumnValue(row, ['eISSN', 'e-ISSN', 'Online ISSN', 'Electronic ISSN']) || issn
-  ).trim();
-  const publisher = String(
-    getColumnValue(row, ['Publisher', 'Publishing House', 'Penerbit', 'Organization']) ||
-      'International Academic Press'
-  ).trim();
+  const abbreviation = str(getColumnValue(row, ['Abbreviation', 'ISO Abbreviation', 'Abbr', 'Short Title']));
+
+  // One ISSN cell may hold "print, electronic"
+  const issnParts = splitList(getColumnValue(row, ['ISSN', 'Print ISSN', 'p-ISSN', 'ISSN-L']), /[,;]/);
+  const issn = issnParts[0] || '';
+  const eissn = str(getColumnValue(row, ['eISSN', 'e-ISSN', 'Online ISSN', 'Electronic ISSN'])) || issnParts[1] || issn;
+  const publisher = str(getColumnValue(row, ['Publisher', 'Publishing House', 'Penerbit', 'Organization']));
 
   const tier = parseTierField(
     getColumnValue(row, ['Tier', 'Quartile', 'Best Quartile', 'SJR Best Quartile', 'JCR Quartile', 'Rank', 'Q'])
   );
 
   const impactFactor = parseNumericField(
-    getColumnValue(row, ['JIF (2025)', 'JIF', 'Impact Factor', 'Journal Impact Factor', 'IF', '2-Year JIF']),
-    1.8
+    getColumnValue(row, ['JIF (2025)', 'JIF', 'Impact Factor', 'Journal Impact Factor', 'IF', '2-Year JIF'])
   );
-
   const fiveYearImpactFactor = parseNumericField(
-    getColumnValue(row, ['5-Year JIF', '5Y JIF', 'Five Year Impact Factor', '5-Yr IF']),
-    Number((impactFactor * 1.2).toFixed(1))
+    getColumnValue(row, ['5-Year JIF', '5Y JIF', 'Five Year Impact Factor', '5-Yr IF'])
+  );
+  const citeScore = parseNumericField(getColumnValue(row, ['CiteScore', 'Scopus CiteScore', 'CS']));
+  const sjrScore = parseNumericField(getColumnValue(row, ['SJR', 'SJR Score', 'SCImago Journal Rank']));
+  const hIndex = parseNumericField(getColumnValue(row, ['H-Index', 'H Index', 'hindex']));
+  const apcRaw = parseApcField(
+    getColumnValue(row, ['APC (USD)', 'APC', 'APC USD', 'Publication Fee', 'Fee', 'Open Access Fee', 'Biaya APC'])
+  );
+  const apcUsd = apcRaw === null ? null : Math.round(apcRaw);
+
+  const rawAccess = str(getColumnValue(row, ['Access Model', 'Open Access', 'OA Model', 'Access'])).toLowerCase();
+  const accessModel: AccessModel = rawAccess.includes('diamond')
+    ? 'Diamond OA'
+    : rawAccess.includes('hybrid')
+    ? 'Hybrid'
+    : rawAccess.includes('sub')
+    ? 'Subscription'
+    : rawAccess.includes('gold') || rawAccess.includes('open')
+    ? 'Gold OA'
+    : apcUsd === 0
+    ? 'Diamond OA'
+    : 'Gold OA';
+
+  // Waiver text is kept exactly as written in the spreadsheet.
+  const rawWaiver = str(getColumnValue(row, ['Waiver Policy', 'Waiver', 'LMIC Waiver', 'HINARI', 'Discount']));
+  const waiverPolicy = rawWaiver || (apcUsd === 0 || accessModel === 'Diamond OA' ? '100% Free (No APC)' : '');
+
+  // "Epidemiology; Public Health" -> primary = first, subjects = all
+  const subjectList = splitList(
+    getColumnValue(row, ['Primary Subject', 'Subject', 'Subject Category', 'Discipline', 'Category', 'Field', 'Bidang'])
+  );
+  const extraSubjects = splitList(getColumnValue(row, ['Subjects', 'All Subjects', 'Subcategories']));
+  const subjects = Array.from(new Set([...subjectList, ...extraSubjects]));
+  const subjectPrimary = subjects[0] || '';
+
+  const country = str(getColumnValue(row, ['Country', 'Publisher Country', 'Negara', 'Nation']));
+
+  const acceptanceRatePct = parseNumericField(
+    getColumnValue(row, ['Acceptance Rate (%)', 'Acceptance Rate', 'Accept Rate', 'Acceptance'])
+  );
+  const firstDecisionDays = parseNumericField(
+    getColumnValue(row, ['First Decision (Days)', 'First Decision', 'Decision Days', 'Review Speed', 'Turnaround'])
+  );
+  const publicationTimeDays = parseNumericField(
+    getColumnValue(row, ['Publication Time (Days)', 'Publication Days', 'Total Days'])
   );
 
-  const citeScore = parseNumericField(
-    getColumnValue(row, ['CiteScore', 'Scopus CiteScore', 'CS']),
-    Number((impactFactor * 1.7).toFixed(1))
-  );
+  const scopeSummary = str(getColumnValue(row, ['Scope', 'Scope Summary', 'Aims and Scope', 'Description', 'Notes']));
+  const indexing = splitList(getColumnValue(row, ['Indexing', 'Databases', 'Indexed In']), /[;|,/]/);
+  const reportingStandards = splitList(getColumnValue(row, ['Reporting Standards', 'EQUATOR Checklists', 'Guidelines']), /[;|,]/);
+  const authorPortalUrl = str(getColumnValue(row, ['Portal URL', 'Author Portal', 'Website', 'URL', 'Link']));
+  const wordLimitAbstract = parseNumericField(getColumnValue(row, ['Abstract Word Limit', 'Abstract Limit']));
+  const wordLimitMainText = str(getColumnValue(row, ['Main Text Limit', 'Word Limit', 'Manuscript Length']));
 
-  const sjrScore = parseNumericField(
-    getColumnValue(row, ['SJR', 'SJR Score', 'SCImago Journal Rank']),
-    Number((impactFactor * 0.42).toFixed(2))
-  );
-
-  const hIndex = Math.round(
-    parseNumericField(getColumnValue(row, ['H-Index', 'H Index', 'hindex']), 48)
-  );
-
-  const apcUsd = Math.round(
-    parseNumericField(
-      getColumnValue(row, ['APC (USD)', 'APC', 'APC USD', 'Publication Fee', 'Fee', 'Open Access Fee', 'Biaya APC']),
-      0
-    )
-  );
-
-  const rawAccess = String(
-    getColumnValue(row, ['Access Model', 'Open Access', 'OA Model', 'Access']) || ''
-  ).trim();
-  const accessModel: AccessModel =
-    rawAccess.toLowerCase().includes('diamond') || (apcUsd === 0 && !rawAccess.toLowerCase().includes('hybrid'))
-      ? 'Diamond OA'
-      : rawAccess.toLowerCase().includes('hybrid')
-      ? 'Hybrid'
-      : rawAccess.toLowerCase().includes('sub')
-      ? 'Subscription'
-      : 'Gold OA';
-
-  const rawWaiver = String(
-    getColumnValue(row, ['Waiver Policy', 'Waiver', 'LMIC Waiver', 'HINARI', 'Discount']) || ''
-  ).trim();
-  const waiverPolicy: WaiverPolicy =
-    apcUsd === 0 || accessModel === 'Diamond OA'
-      ? '100% Free (No APC)'
-      : accessModel === 'Hybrid'
-      ? 'Standard Subscription (Zero OA Fee)'
-      : rawWaiver.toLowerCase().includes('50%')
-      ? '50% LMIC Discount'
-      : rawWaiver.toLowerCase().includes('case')
-      ? 'Case-by-Case Institutional Waiver'
-      : 'Full HINARI / Research4Life A&B Waiver';
-
-  const subjectPrimary = String(
-    getColumnValue(row, [
-      'Primary Subject',
-      'Subject',
-      'Subject Category',
-      'Discipline',
-      'Category',
-      'Field',
-      'Bidang',
-    ]) || 'Public, Environmental & Occupational Health'
-  ).trim();
-
-  const rawSubjects = getColumnValue(row, ['Subjects', 'All Subjects', 'Subcategories']);
-  const subjects = rawSubjects
-    ? String(rawSubjects)
-        .split(/[;|,]/)
-        .map((s) => s.trim())
-        .filter(Boolean)
-    : [subjectPrimary];
-
-  const country = String(
-    getColumnValue(row, ['Country', 'Publisher Country', 'Negara', 'Nation']) || 'Switzerland'
-  ).trim();
-
-  const acceptanceRatePct = Math.round(
-    parseNumericField(
-      getColumnValue(row, ['Acceptance Rate (%)', 'Acceptance Rate', 'Accept Rate', 'Acceptance']),
-      26
-    )
-  );
-
-  const firstDecisionDays = Math.round(
-    parseNumericField(
-      getColumnValue(row, ['First Decision (Days)', 'First Decision', 'Decision Days', 'Review Speed', 'Turnaround']),
-      28
-    )
-  );
-
-  const publicationTimeDays = Math.round(
-    parseNumericField(
-      getColumnValue(row, ['Publication Time (Days)', 'Publication Days', 'Total Days']),
-      firstDecisionDays * 2 + 15
-    )
-  );
-
-  const scopeSummary = String(
-    getColumnValue(row, ['Scope', 'Scope Summary', 'Aims and Scope', 'Description', 'Notes']) ||
-      `Publishes peer-reviewed international research in ${subjectPrimary} and global public health.`
-  ).trim();
-
-  const rawIndexing = getColumnValue(row, ['Indexing', 'Databases', 'Indexed In']);
-  const indexing = rawIndexing
-    ? String(rawIndexing)
-        .split(/[;|,/]/)
-        .map((s) => s.trim())
-        .filter(Boolean)
-    : ['Scopus', 'MEDLINE', 'DOAJ'];
-
-  const rawStandards = getColumnValue(row, ['Reporting Standards', 'EQUATOR Checklists', 'Guidelines']);
-  const reportingStandards = rawStandards
-    ? String(rawStandards)
-        .split(/[;|,]/)
-        .map((s) => s.trim())
-        .filter(Boolean)
-    : ['STROBE', 'CONSORT', 'PRISMA'];
-
-  const authorPortalUrl = String(
-    getColumnValue(row, ['Portal URL', 'Author Portal', 'Website', 'URL', 'Link']) ||
-      'https://www.equator-network.org/'
-  ).trim();
-
-  const wordLimitAbstract = Math.round(
-    parseNumericField(getColumnValue(row, ['Abstract Word Limit', 'Abstract Limit']), 250)
-  );
-
-  const wordLimitMainText = String(
-    getColumnValue(row, ['Main Text Limit', 'Word Limit', 'Manuscript Length']) ||
-      '3,500 words (Original Articles)'
-  ).trim();
+  const guidelines: Partial<SubmissionGuidelines> = {};
+  if (reportingStandards.length) guidelines.reportingStandards = reportingStandards;
+  if (authorPortalUrl) guidelines.authorPortalUrl = authorPortalUrl;
+  if (wordLimitAbstract !== null) guidelines.wordLimitAbstract = Math.round(wordLimitAbstract);
+  if (wordLimitMainText) guidelines.wordLimitMainText = wordLimitMainText;
 
   return {
     title,
@@ -247,7 +191,7 @@ function mapSpreadsheetRowToJournal(row: Record<string, unknown>): Partial<Healt
     fiveYearImpactFactor,
     citeScore,
     sjrScore,
-    hIndex,
+    hIndex: hIndex === null ? null : Math.round(hIndex),
     apcUsd,
     accessModel,
     waiverPolicy,
@@ -256,31 +200,21 @@ function mapSpreadsheetRowToJournal(row: Record<string, unknown>): Partial<Healt
     country,
     indexing,
     acceptanceRatePct,
-    firstDecisionDays,
-    publicationTimeDays,
+    firstDecisionDays: firstDecisionDays === null ? null : Math.round(firstDecisionDays),
+    publicationTimeDays: publicationTimeDays === null ? null : Math.round(publicationTimeDays),
     scopeSummary,
-    keyTopics: [subjectPrimary, country, `${tier} Health Journal`],
-    guidelines: {
-      reportingStandards,
-      wordLimitAbstract,
-      wordLimitMainText,
-      maxReferences: 40,
-      maxTablesFigures: 5,
-      referenceStyle: 'Vancouver (Numbered)',
-      blindingPolicy: 'Double-Blind',
-      ethicsRequirements: [
-        'Institutional Review Board (IRB) or National Ethics Committee approval number required in Methods',
-        'Informed consent and declaration of competing interests mandatory',
-      ],
-      dataSharingPolicy: 'Mandatory Data Availability Statement prior to reference list.',
-      coverLetterChecklist: [
-        'Highlight public health relevance and international readership value',
-        'Confirm compliance with reporting checklist and authorship criteria',
-      ],
-      preprintPolicy: 'Permits preprint submissions on medRxiv, bioRxiv, or SSRN.',
-      authorPortalUrl,
-    },
+    guidelines,
   };
+}
+
+/** Reads a response body as JSON without throwing on HTML / text error pages. */
+async function readJsonSafely(response: Response): Promise<any | null> {
+  const text = await response.text();
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
 }
 
 export default function SpreadsheetImporterModal({
@@ -294,12 +228,13 @@ export default function SpreadsheetImporterModal({
   const [sheetNames, setSheetNames] = useState<string[]>([]);
   const [selectedSheet, setSelectedSheet] = useState<string>('');
   const [workbookRef, setWorkbookRef] = useState<XLSX.WorkBook | null>(null);
-  const [parsedRows, setParsedRows] = useState<Array<Partial<HealthJournal>>>([]);
+  const [parsedRows, setParsedRows] = useState<ImportRow[]>([]);
   const [importMode, setImportMode] = useState<'merge' | 'replace'>('merge');
   const [parseError, setParseError] = useState<string | null>(null);
   const [isApplying, setIsApplying] = useState<boolean>(false);
   const [isResetting, setIsResetting] = useState<boolean>(false);
   const [isDragging, setIsDragging] = useState<boolean>(false);
+  const [importProgress, setImportProgress] = useState<{ done: number; total: number } | null>(null);
 
   if (!isOpen) return null;
 
@@ -321,7 +256,7 @@ export default function SpreadsheetImporterModal({
 
     const mapped = rawJson
       .map((r) => mapSpreadsheetRowToJournal(r))
-      .filter((item): item is Partial<HealthJournal> => item !== null);
+      .filter((item): item is ImportRow => item !== null);
 
     if (mapped.length === 0) {
       setParsedRows([]);
@@ -463,25 +398,55 @@ export default function SpreadsheetImporterModal({
     if (parsedRows.length === 0) return;
     setIsApplying(true);
     setParseError(null);
+    const total = parsedRows.length;
+    let addedCount = 0;
+    let updatedCount = 0;
+    let lastData: any = null;
+    let done = 0;
     try {
-      const response = await fetch('/api/journals/bulk', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          journals: parsedRows,
-          mode: importMode,
-        }),
-      });
-      const data = await response.json();
-      if (!response.ok) {
-        throw new Error(data.error || 'Failed to update journal database.');
+      // Upload in batches so a large file never exceeds the server's request-size limit.
+      // In "replace" mode only the first batch replaces the catalog; later batches are merged into it.
+      for (let start = 0; start < total; start += IMPORT_BATCH_SIZE) {
+        const batch = parsedRows.slice(start, start + IMPORT_BATCH_SIZE);
+        setImportProgress({ done, total });
+        const response = await fetch('/api/journals/bulk', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            journals: batch,
+            mode: importMode === 'replace' && start === 0 ? 'replace' : 'merge',
+            offset: start,
+          }),
+        });
+        const data = await readJsonSafely(response);
+        if (!response.ok || !data || !Array.isArray(data.journals)) {
+          const reason =
+            data?.error ||
+            (response.status === 413
+              ? 'the batch was too large for the server (HTTP 413)'
+              : `the server returned an unexpected response (HTTP ${response.status})`);
+          throw new Error(
+            `Import stopped at rows ${start + 1}–${start + batch.length}: ${reason}.` +
+              (done > 0 ? ` The first ${done} rows were already saved.` : ' Nothing was saved.')
+          );
+        }
+        addedCount += data.summary?.addedCount ?? 0;
+        updatedCount += data.summary?.updatedCount ?? 0;
+        done += batch.length;
+        lastData = data;
       }
-      onDatabaseUpdated(data.journals, data.summary);
+      onDatabaseUpdated(lastData.journals, {
+        mode: importMode,
+        addedCount,
+        updatedCount,
+        totalCount: lastData.summary?.totalCount ?? lastData.journals.length,
+      });
       onClose();
     } catch (err) {
       setParseError(err instanceof Error ? err.message : 'Error updating database on server.');
     } finally {
       setIsApplying(false);
+      setImportProgress(null);
     }
   };
 
@@ -492,8 +457,11 @@ export default function SpreadsheetImporterModal({
       const response = await fetch('/api/journals/reset', {
         method: 'POST',
       });
-      const data = await response.json();
-      if (response.ok && data.journals) {
+      const data = await readJsonSafely(response);
+      if (!response.ok || !data) {
+        throw new Error(data?.error || `Reset failed (HTTP ${response.status}).`);
+      }
+      if (data.journals) {
         onDatabaseUpdated(data.journals, {
           mode: 'replace',
           addedCount: data.journals.length,
@@ -513,11 +481,11 @@ export default function SpreadsheetImporterModal({
   const matchPreviewCounts = parsedRows.reduce(
     (acc, row) => {
       const cleanTitle = (row.title || '').trim().toLowerCase();
-      const cleanIssn = (row.issn || '').trim().toLowerCase();
+      const issns = [row.issn, row.eissn].map((x) => (x || '').trim().toLowerCase()).filter(Boolean);
       const exists = existingJournals.some(
         (ex) =>
           ex.title.trim().toLowerCase() === cleanTitle ||
-          (cleanIssn && cleanIssn !== '2049-3630' && (ex.issn.toLowerCase() === cleanIssn || ex.eissn.toLowerCase() === cleanIssn))
+          issns.some((x) => x === (ex.issn || '').toLowerCase() || x === (ex.eissn || '').toLowerCase())
       );
       if (exists) acc.updates += 1;
       else acc.additions += 1;
@@ -613,7 +581,7 @@ export default function SpreadsheetImporterModal({
             {fileName ? `Loaded File: ${fileName}` : 'Click to select or drag and drop an .XLSX, .XLS, or .CSV file'}
           </div>
           <p className="mt-1 text-xs text-slate-500 dark:text-slate-400 max-w-xl mx-auto">
-            Automatically maps columns: Title / Journal Name, Tier / Quartile (Q1–Q4), JIF / Impact Factor, CiteScore, SJR, APC (USD), Access Model, Waiver Policy, Subject, Country, ISSN, Acceptance Rate, and First Decision Days.
+            Automatically maps columns: Title / Journal Name, Tier / Quartile (Q1–Q4), JIF / Impact Factor, CiteScore, SJR, APC (USD), Access Model, Waiver Policy, Subject, Country, ISSN, Acceptance Rate, and First Decision Days. Empty cells stay empty: missing metrics are shown as “—”, never estimated.
           </p>
         </div>
 
@@ -719,13 +687,13 @@ export default function SpreadsheetImporterModal({
                           {row.tier}
                         </td>
                         <td className="py-2 px-2 text-right font-mono tabular-nums">
-                          {Number(row.impactFactor || 0).toFixed(1)}
+                          {fmtNum(row.impactFactor)}
                         </td>
                         <td className="py-2 px-2 text-right font-mono tabular-nums">
-                          {Number(row.citeScore || 0).toFixed(1)}
+                          {fmtNum(row.citeScore)}
                         </td>
                         <td className="py-2 px-3 text-right font-mono tabular-nums">
-                          {row.apcUsd === 0 ? '$0 Free' : `$${Number(row.apcUsd || 0).toLocaleString()}`}
+                          {fmtApc(row.apcUsd)}
                         </td>
                         <td className="py-2 px-3 text-slate-600 dark:text-slate-300 truncate max-w-[180px]">
                           {row.subjectPrimary}
@@ -764,7 +732,9 @@ export default function SpreadsheetImporterModal({
               {isApplying ? (
                 <>
                   <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                  Updating Database...
+                  {importProgress
+                    ? `Saving ${Math.min(importProgress.done + IMPORT_BATCH_SIZE, importProgress.total)} of ${importProgress.total}...`
+                    : 'Updating Database...'}
                 </>
               ) : (
                 <>
