@@ -1,13 +1,11 @@
-export type JournalTier = 'Q1' | 'Q2' | 'Q3' | 'Q4';
+// 'NR' = not ranked / quartile not reported
+export type JournalTier = 'Q1' | 'Q2' | 'Q3' | 'Q4' | 'NR';
 
 export type AccessModel = 'Diamond OA' | 'Gold OA' | 'Hybrid' | 'Subscription';
 
-export type WaiverPolicy =
-  | 'Full HINARI / Research4Life A&B Waiver'
-  | '50% LMIC Discount'
-  | '100% Free (No APC)'
-  | 'Case-by-Case Institutional Waiver'
-  | 'Standard Subscription (Zero OA Fee)';
+// Free text: imported waiver / discount notes are kept as written.
+// Seed data uses labels such as 'Full HINARI / Research4Life A&B Waiver' or '100% Free (No APC)'.
+export type WaiverPolicy = string;
 
 export interface ImpactTrendPoint {
   year: number;
@@ -17,19 +15,21 @@ export interface ImpactTrendPoint {
 
 export interface SubmissionGuidelines {
   reportingStandards: string[];
-  wordLimitAbstract: number;
-  wordLimitMainText: string;
-  maxReferences: number;
-  maxTablesFigures: number;
-  referenceStyle: 'Vancouver (Numbered)' | 'AMA 11th Edition' | 'APA 7th Edition' | 'Harvard';
-  blindingPolicy: 'Double-Blind' | 'Single-Blind' | 'Open Peer Review';
+  // null = not recorded for this journal (never guessed)
+  wordLimitAbstract: number | null;
+  wordLimitMainText: string | null;
+  maxReferences: number | null;
+  maxTablesFigures: number | null;
+  referenceStyle: 'Vancouver (Numbered)' | 'AMA 11th Edition' | 'APA 7th Edition' | 'Harvard' | null;
+  blindingPolicy: 'Double-Blind' | 'Single-Blind' | 'Open Peer Review' | null;
   ethicsRequirements: string[];
-  dataSharingPolicy: string;
+  dataSharingPolicy: string | null;
   coverLetterChecklist: string[];
-  preprintPolicy: string;
+  preprintPolicy: string | null;
   authorPortalUrl: string;
 }
 
+// Metric fields are null when the value is unknown. Never substitute a default number.
 export interface HealthJournal {
   id: string;
   title: string;
@@ -38,12 +38,12 @@ export interface HealthJournal {
   eissn: string;
   publisher: string;
   tier: JournalTier;
-  sjrScore: number;
-  impactFactor: number;
-  fiveYearImpactFactor: number;
-  citeScore: number;
-  hIndex: number;
-  apcUsd: number;
+  sjrScore: number | null;
+  impactFactor: number | null;
+  fiveYearImpactFactor: number | null;
+  citeScore: number | null;
+  hIndex: number | null;
+  apcUsd: number | null;
   accessModel: AccessModel;
   waiverPolicy: WaiverPolicy;
   subjectPrimary: string;
@@ -51,9 +51,9 @@ export interface HealthJournal {
   country: string;
   region: 'North America' | 'Europe' | 'Asia-Pacific' | 'Latin America' | 'Africa & Middle East' | 'Global / Multilateral';
   indexing: string[];
-  acceptanceRatePct: number;
-  firstDecisionDays: number;
-  publicationTimeDays: number;
+  acceptanceRatePct: number | null;
+  firstDecisionDays: number | null;
+  publicationTimeDays: number | null;
   scopeSummary: string;
   keyTopics: string[];
   impactHistory: ImpactTrendPoint[];
