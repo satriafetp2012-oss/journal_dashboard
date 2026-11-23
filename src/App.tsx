@@ -36,6 +36,7 @@ import {
   OpenAlexPaper,
 } from './data/journals';
 import SpreadsheetImporterModal from './components/SpreadsheetImporterModal';
+import { DASH, fmtNum, fmtInt, fmtApc, isKnown, compareNullable, hasWaiverRoute } from './lib/format';
 
 type WorkspaceTab = 'explorer' | 'matcher' | 'impact' | 'guidelines';
 
@@ -79,6 +80,9 @@ export default function App() {
   const [apcFilterMode, setApcFilterMode] = useState<'ALL' | 'ZERO_APC' | 'WAIVER_ELIGIBLE' | 'UNDER_1500' | 'UNDER_3000'>('ALL');
   const [sortField, setSortField] = useState<SortField>('impactFactor');
   const [sortOrder, setSortOrder] = useState<SortOrder>('desc');
+  // Large catalogs: render the table a page at a time.
+  const ROWS_PER_PAGE = 100;
+  const [visibleRowCount, setVisibleRowCount] = useState<number>(ROWS_PER_PAGE);
 
   // Active Journal Selection for Deep Inspection (Impact & Guidelines)
   const [selectedJournalId, setSelectedJournalId] = useState<string>(HEALTH_JOURNALS[0].id);
@@ -98,14 +102,15 @@ export default function App() {
     issn: '',
     publisher: '',
     tier: 'Q1' as JournalTier,
-    impactFactor: '3.4',
-    citeScore: '6.2',
-    sjrScore: '1.35',
-    apcUsd: '0',
+    // Blank = unknown. Placeholder numbers here used to be saved as real data.
+    impactFactor: '',
+    citeScore: '',
+    sjrScore: '',
+    apcUsd: '',
     subjectPrimary: SUBJECT_CATEGORIES[1] as string,
     country: 'Switzerland',
-    acceptanceRatePct: '24',
-    firstDecisionDays: '28',
+    acceptanceRatePct: '',
+    firstDecisionDays: '',
     scopeSummary: '',
   });
   const [isSavingJournal, setIsSavingJournal] = useState<boolean>(false);
@@ -192,18 +197,11 @@ export default function App() {
         }
         if (selectedCountry !== 'All Countries' && j.country !== selectedCountry) return false;
 
-        if (apcFilterMode === 'ZERO_APC' && j.apcUsd > 0 && j.accessModel !== 'Hybrid') return false;
-        if (
-          apcFilterMode === 'WAIVER_ELIGIBLE' &&
-          j.apcUsd > 0 &&
-          !j.waiverPolicy.includes('Waiver') &&
-          !j.waiverPolicy.includes('Discount') &&
-          !j.waiverPolicy.includes('Zero')
-        ) {
-          return false;
-        }
-        if (apcFilterMode === 'UNDER_1500' && j.apcUsd > 1500) return false;
-        if (apcFilterMode === 'UNDER_3000' && j.apcUsd > 3000) return false;
+        // Unknown APC (null) never counts as free or as within budget.
+        if (apcFilterMode === 'ZERO_APC' && j.apcUsd !== 0 && j.accessModel !== 'Hybrid') return false;
+        if (apcFilterMode === 'WAIVER_ELIGIBLE' && !hasWaiverRoute(j)) return false;
+        if (apcFilterMode === 'UNDER_1500' && !(isKnown(j.apcUsd) && j.apcUsd <= 1500)) return false;
+        if (apcFilterMode === 'UNDER_3000' && !(isKnown(j.apcUsd) && j.apcUsd <= 3000)) return false;
 
         if (searchQuery.trim()) {
           const q = searchQuery.toLowerCase();
@@ -219,26 +217,28 @@ export default function App() {
         }
         return true;
       })
-      .sort((a, b) => {
-        const valA = a[sortField];
-        const valB = b[sortField];
-        return sortOrder === 'asc' ? valA - valB : valB - valA;
-      });
+      .sort((a, b) => compareNullable(a[sortField], b[sortField], sortOrder));
   }, [journals, selectedTier, selectedSubject, selectedCountry, apcFilterMode, searchQuery, sortField, sortOrder]);
+
+  useEffect(() => {
+    setVisibleRowCount(ROWS_PER_PAGE);
+  }, [selectedTier, selectedSubject, selectedCountry, apcFilterMode, searchQuery, sortField, sortOrder]);
 
   // Aggregate metrics for current filtered view
   const directoryStats = useMemo(() => {
     const count = filteredJournals.length;
     if (count === 0) {
-      return { count: 0, q1Count: 0, zeroApcCount: 0, medianJif: '0.0', avgDecisionDays: 0 };
+      return { count: 0, q1Count: 0, zeroApcCount: 0, medianJif: DASH, avgDecisionDays: DASH };
     }
     const q1Count = filteredJournals.filter((j) => j.tier === 'Q1').length;
     const zeroApcCount = filteredJournals.filter((j) => j.apcUsd === 0 || j.accessModel === 'Hybrid').length;
-    const sortedJifs = [...filteredJournals].map((j) => j.impactFactor).sort((a, b) => a - b);
-    const medianJif = sortedJifs[Math.floor(sortedJifs.length / 2)].toFixed(1);
-    const avgDecisionDays = Math.round(
-      filteredJournals.reduce((acc, j) => acc + j.firstDecisionDays, 0) / count
-    );
+    // Summary stats use only journals where the value is known.
+    const sortedJifs = filteredJournals.map((j) => j.impactFactor).filter(isKnown).sort((a, b) => a - b);
+    const medianJif = sortedJifs.length ? sortedJifs[Math.floor(sortedJifs.length / 2)].toFixed(1) : DASH;
+    const knownDecisions = filteredJournals.map((j) => j.firstDecisionDays).filter(isKnown);
+    const avgDecisionDays = knownDecisions.length
+      ? String(Math.round(knownDecisions.reduce((acc, d) => acc + d, 0) / knownDecisions.length))
+      : DASH;
     return { count, q1Count, zeroApcCount, medianJif, avgDecisionDays };
   }, [filteredJournals]);
 
@@ -286,17 +286,17 @@ export default function App() {
       `"${j.issn}"`,
       `"${j.publisher.replace(/"/g, '""')}"`,
       j.tier,
-      j.impactFactor,
-      j.fiveYearImpactFactor,
-      j.citeScore,
-      j.sjrScore,
-      j.apcUsd,
+      j.impactFactor ?? '',
+      j.fiveYearImpactFactor ?? '',
+      j.citeScore ?? '',
+      j.sjrScore ?? '',
+      j.apcUsd ?? '',
       `"${j.accessModel}"`,
       `"${j.waiverPolicy}"`,
       `"${j.subjectPrimary}"`,
       `"${j.country}"`,
-      j.acceptanceRatePct,
-      j.firstDecisionDays,
+      j.acceptanceRatePct ?? '',
+      j.firstDecisionDays ?? '',
       `"${j.guidelines.reportingStandards.join('; ')}"`,
       `"${j.guidelines.authorPortalUrl}"`,
     ]);
@@ -402,14 +402,14 @@ export default function App() {
           issn: newJournalForm.issn,
           publisher: newJournalForm.publisher,
           tier: newJournalForm.tier,
-          impactFactor: Number(newJournalForm.impactFactor),
-          citeScore: Number(newJournalForm.citeScore),
-          sjrScore: Number(newJournalForm.sjrScore),
-          apcUsd: Number(newJournalForm.apcUsd),
+          impactFactor: newJournalForm.impactFactor.trim() === '' ? null : Number(newJournalForm.impactFactor),
+          citeScore: newJournalForm.citeScore.trim() === '' ? null : Number(newJournalForm.citeScore),
+          sjrScore: newJournalForm.sjrScore.trim() === '' ? null : Number(newJournalForm.sjrScore),
+          apcUsd: newJournalForm.apcUsd.trim() === '' ? null : Number(newJournalForm.apcUsd),
           subjectPrimary: newJournalForm.subjectPrimary,
           country: newJournalForm.country,
-          acceptanceRatePct: Number(newJournalForm.acceptanceRatePct),
-          firstDecisionDays: Number(newJournalForm.firstDecisionDays),
+          acceptanceRatePct: newJournalForm.acceptanceRatePct.trim() === '' ? null : Number(newJournalForm.acceptanceRatePct),
+          firstDecisionDays: newJournalForm.firstDecisionDays.trim() === '' ? null : Number(newJournalForm.firstDecisionDays),
           scopeSummary: newJournalForm.scopeSummary,
         }),
       });
@@ -427,19 +427,19 @@ export default function App() {
   const copySubmissionBrief = (journal: HealthJournal) => {
     const g = journal.guidelines;
     const text = [
-      `SUBMISSION READINESS BRIEF — ${journal.title.toUpperCase()} (${journal.abbreviation})`,
+      `SUBMISSION READINESS BRIEF — ${journal.title.toUpperCase()} ${journal.abbreviation ? ` (${journal.abbreviation})` : ''}`,
       `ISSN: ${journal.issn} | Publisher: ${journal.publisher} (${journal.country})`,
-      `Tier: ${journal.tier} | JIF: ${journal.impactFactor.toFixed(1)} | 5Y-JIF: ${journal.fiveYearImpactFactor.toFixed(1)} | CiteScore: ${journal.citeScore.toFixed(1)} | SJR: ${journal.sjrScore.toFixed(2)}`,
-      `APC: $${journal.apcUsd} USD (${journal.accessModel} · ${journal.waiverPolicy})`,
-      `Review Speed: ~${journal.firstDecisionDays} days to 1st decision | Acceptance Rate: ${journal.acceptanceRatePct}%`,
+      `Tier: ${journal.tier} | JIF: ${fmtNum(journal.impactFactor)} | 5Y-JIF: ${fmtNum(journal.fiveYearImpactFactor)} | CiteScore: ${fmtNum(journal.citeScore)} | SJR: ${fmtNum(journal.sjrScore, 2)}`,
+      `APC: ${fmtApc(journal.apcUsd)} (${journal.accessModel} · ${journal.waiverPolicy || 'waiver policy not recorded'})`,
+      `Review Speed: ${fmtInt(journal.firstDecisionDays, ' days')} to 1st decision | Acceptance Rate: ${fmtInt(journal.acceptanceRatePct, '%')}`,
       ``,
       `1. FORMATTING & LENGTH LIMITS`,
-      `- Abstract Limit: ${g.wordLimitAbstract} words`,
-      `- Main Text Limit: ${g.wordLimitMainText}`,
-      `- Max References: ${g.maxReferences} (${g.referenceStyle})`,
-      `- Max Tables/Figures: ${g.maxTablesFigures}`,
-      `- Peer Review Mode: ${g.blindingPolicy}`,
-      `- Required EQUATOR Checklists: ${g.reportingStandards.join(', ')}`,
+      `- Abstract Limit: ${g.wordLimitAbstract ?? 'not recorded'}${g.wordLimitAbstract ? ' words' : ''}`,
+      `- Main Text Limit: ${g.wordLimitMainText ?? 'not recorded'}`,
+      `- Max References: ${g.maxReferences ?? 'not recorded'} (${g.referenceStyle ?? 'style not recorded'})`,
+      `- Max Tables/Figures: ${g.maxTablesFigures ?? 'not recorded'}`,
+      `- Peer Review Mode: ${g.blindingPolicy ?? 'not recorded'}`,
+      `- Required EQUATOR Checklists: ${g.reportingStandards.join(', ') || 'not recorded'}`,
       ``,
       `2. MANDATORY ETHICS & DECLARATIONS`,
       ...g.ethicsRequirements.map((req) => `- [ ] ${req}`),
@@ -448,9 +448,9 @@ export default function App() {
       ...g.coverLetterChecklist.map((item) => `- [ ] ${item}`),
       ``,
       `4. DATA SHARING & PREPRINTS`,
-      `- Data Policy: ${g.dataSharingPolicy}`,
-      `- Preprint Policy: ${g.preprintPolicy}`,
-      `- Author Portal: ${g.authorPortalUrl}`,
+      `- Data Policy: ${g.dataSharingPolicy ?? 'not recorded'}`,
+      `- Preprint Policy: ${g.preprintPolicy ?? 'not recorded'}`,
+      `- Author Portal: ${g.authorPortalUrl || 'not recorded'}`,
     ].join('\n');
 
     navigator.clipboard.writeText(text);
@@ -723,7 +723,7 @@ export default function App() {
               <div className="p-4 col-span-2 lg:col-span-1">
                 <div className="text-xs text-slate-500 dark:text-slate-400">Mean Time to 1st Decision</div>
                 <div className="mt-1 text-2xl font-bold font-mono tabular-nums text-slate-900 dark:text-slate-100">
-                  {directoryStats.avgDecisionDays}d
+                  {directoryStats.avgDecisionDays === DASH ? DASH : `${directoryStats.avgDecisionDays}d`}
                 </div>
                 <div className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
                   Initial editorial &amp; peer cycle
@@ -927,7 +927,7 @@ export default function App() {
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-200 dark:divide-slate-800 text-sm">
-                      {filteredJournals.map((journal) => {
+                      {filteredJournals.slice(0, visibleRowCount).map((journal) => {
                         const isSelected = journal.id === selectedJournalId;
                         return (
                           <tr
@@ -949,9 +949,11 @@ export default function App() {
                                 <span aria-hidden="true">·</span>
                                 <span>{journal.publisher}</span>
                                 <span aria-hidden="true">·</span>
-                                <span className="text-slate-600 dark:text-slate-300">
-                                  {journal.indexing.join(' / ')}
-                                </span>
+                                {journal.indexing.length > 0 && (
+                                  <span className="text-slate-600 dark:text-slate-300">
+                                    {journal.indexing.join(' / ')}
+                                  </span>
+                                )}
                               </div>
                             </td>
 
@@ -975,20 +977,20 @@ export default function App() {
                             {/* Impact Factor & 5-Year JIF */}
                             <td className="py-3.5 px-3 text-right font-mono tabular-nums whitespace-nowrap">
                               <div className="font-bold text-slate-900 dark:text-slate-100">
-                                {journal.impactFactor.toFixed(1)}
+                                {fmtNum(journal.impactFactor)}
                               </div>
                               <div className="text-xs text-slate-500 dark:text-slate-400">
-                                5Y: {journal.fiveYearImpactFactor.toFixed(1)}
+                                5Y: {fmtNum(journal.fiveYearImpactFactor)}
                               </div>
                             </td>
 
                             {/* CiteScore & SJR */}
                             <td className="py-3.5 px-3 text-right font-mono tabular-nums whitespace-nowrap">
                               <div className="font-semibold text-slate-900 dark:text-slate-100">
-                                {journal.citeScore.toFixed(1)}
+                                {fmtNum(journal.citeScore)}
                               </div>
                               <div className="text-xs text-slate-500 dark:text-slate-400">
-                                SJR {journal.sjrScore.toFixed(2)}
+                                SJR {fmtNum(journal.sjrScore, 2)}
                               </div>
                             </td>
 
@@ -1001,10 +1003,14 @@ export default function App() {
                                     : 'text-slate-900 dark:text-slate-100'
                                 }`}
                               >
-                                {journal.apcUsd === 0 ? '$0 Free' : `$${journal.apcUsd.toLocaleString()}`}
+                                {fmtApc(journal.apcUsd)}
                               </div>
-                              <div className="text-xs text-slate-500 dark:text-slate-400">
-                                {journal.accessModel} · {journal.waiverPolicy}
+                              <div
+                                className="text-xs text-slate-500 dark:text-slate-400 max-w-[240px] ml-auto truncate"
+                                title={journal.waiverPolicy || undefined}
+                              >
+                                {journal.accessModel}
+                                {journal.waiverPolicy ? ` · ${journal.waiverPolicy}` : ''}
                               </div>
                             </td>
 
@@ -1014,17 +1020,17 @@ export default function App() {
                                 {journal.subjectPrimary}
                               </div>
                               <div className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
-                                {journal.country} · {journal.region}
+                                {[journal.country, journal.region].filter(Boolean).join(' · ') || DASH}
                               </div>
                             </td>
 
                             {/* Speed & Acceptance Rate */}
                             <td className="py-3.5 px-3 text-right font-mono tabular-nums whitespace-nowrap">
                               <div className="text-slate-900 dark:text-slate-100 font-medium">
-                                {journal.firstDecisionDays}d decision
+                                {isKnown(journal.firstDecisionDays) ? `${journal.firstDecisionDays}d decision` : `${DASH} decision`}
                               </div>
                               <div className="text-xs text-slate-500 dark:text-slate-400">
-                                {journal.acceptanceRatePct}% accept
+                                {isKnown(journal.acceptanceRatePct) ? `${journal.acceptanceRatePct}% accept` : `${DASH} accept`}
                               </div>
                             </td>
 
@@ -1052,6 +1058,20 @@ export default function App() {
                       })}
                     </tbody>
                   </table>
+                  {filteredJournals.length > visibleRowCount && (
+                    <div className="p-4 flex items-center justify-center gap-3 border-t border-slate-200 dark:border-slate-800 text-xs text-slate-600 dark:text-slate-400">
+                      <span>
+                        Showing {visibleRowCount.toLocaleString()} of {filteredJournals.length.toLocaleString()} journals
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => setVisibleRowCount((n) => n + ROWS_PER_PAGE)}
+                        className="px-3 py-1.5 font-semibold text-teal-800 dark:text-teal-300 bg-teal-50 dark:bg-teal-950/40 hover:bg-teal-100 dark:hover:bg-teal-900/40 rounded-md"
+                      >
+                        Show {Math.min(ROWS_PER_PAGE, filteredJournals.length - visibleRowCount)} more
+                      </button>
+                    </div>
+                  )}
                 </div>
               </div>
             )}
@@ -1062,7 +1082,7 @@ export default function App() {
                 <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 pb-4 border-b border-slate-200 dark:border-slate-800">
                   <div>
                     <div className="text-xs text-slate-500 dark:text-slate-400">
-                      Selected Venue Snapshot · {selectedJournal.abbreviation} · ISSN {selectedJournal.issn}
+                      Selected Venue Snapshot{selectedJournal.abbreviation ? ` · ${selectedJournal.abbreviation}` : ''}{selectedJournal.issn ? ` · ISSN ${selectedJournal.issn}` : ''}
                     </div>
                     <h2 className="text-xl font-bold text-slate-900 dark:text-slate-100 font-display mt-0.5">
                       {selectedJournal.title}
@@ -1085,15 +1105,17 @@ export default function App() {
                       <FileCheck2 className="w-3.5 h-3.5" />
                       Full Submission Guidelines
                     </button>
-                    <a
-                      href={selectedJournal.guidelines.authorPortalUrl}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium text-slate-700 dark:text-slate-300 border border-slate-300 dark:border-slate-700 rounded-lg hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors whitespace-nowrap shrink-0"
-                    >
-                      Editorial Portal
-                      <ExternalLink className="w-3.5 h-3.5" />
-                    </a>
+                    {selectedJournal.guidelines.authorPortalUrl && (
+                      <a
+                        href={selectedJournal.guidelines.authorPortalUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium text-slate-700 dark:text-slate-300 border border-slate-300 dark:border-slate-700 rounded-lg hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors whitespace-nowrap shrink-0"
+                      >
+                        Editorial Portal
+                        <ExternalLink className="w-3.5 h-3.5" />
+                      </a>
+                    )}
                   </div>
                 </div>
 
@@ -1103,7 +1125,7 @@ export default function App() {
                       Editorial Scope &amp; Target Readership
                     </div>
                     <p className="text-sm text-slate-600 dark:text-slate-400 leading-relaxed">
-                      {selectedJournal.scopeSummary}
+                      {selectedJournal.scopeSummary || 'Scope not recorded. Check the journal website.'}
                     </p>
                     <div className="mt-3 text-xs text-slate-500 dark:text-slate-400">
                       <span className="font-semibold text-slate-700 dark:text-slate-300">Priority Topics: </span>
@@ -1113,19 +1135,21 @@ export default function App() {
                   <div className="space-y-1.5 text-xs text-slate-600 dark:text-slate-400 border-t lg:border-t-0 lg:border-l border-slate-200 dark:border-slate-800 pt-4 lg:pt-0 lg:pl-6">
                     <div>
                       <span className="font-semibold text-slate-800 dark:text-slate-200">Mandatory Checklists: </span>
-                      {selectedJournal.guidelines.reportingStandards.join(' · ')}
+                      {selectedJournal.guidelines.reportingStandards.join(' · ') || 'Not recorded'}
                     </div>
                     <div>
                       <span className="font-semibold text-slate-800 dark:text-slate-200">Word Limit: </span>
-                      Abstract {selectedJournal.guidelines.wordLimitAbstract}w / Main {selectedJournal.guidelines.wordLimitMainText}
+                      Abstract {selectedJournal.guidelines.wordLimitAbstract ? `${selectedJournal.guidelines.wordLimitAbstract}w` : DASH} / Main{' '}
+                      {selectedJournal.guidelines.wordLimitMainText ?? DASH}
                     </div>
                     <div>
                       <span className="font-semibold text-slate-800 dark:text-slate-200">Peer Review Mode: </span>
-                      {selectedJournal.guidelines.blindingPolicy} ({selectedJournal.guidelines.referenceStyle})
+                      {selectedJournal.guidelines.blindingPolicy ?? 'Not recorded'}
+                      {selectedJournal.guidelines.referenceStyle ? ` (${selectedJournal.guidelines.referenceStyle})` : ''}
                     </div>
                     <div>
                       <span className="font-semibold text-slate-800 dark:text-slate-200">Waiver Policy: </span>
-                      {selectedJournal.waiverPolicy}
+                      {selectedJournal.waiverPolicy || 'Not recorded'}
                     </div>
                   </div>
                 </div>
@@ -1407,9 +1431,9 @@ export default function App() {
                                 {matchedJournal.title}
                               </h4>
                               <div className="mt-1 text-xs text-slate-500 dark:text-slate-400 font-mono">
-                                JIF {matchedJournal.impactFactor.toFixed(1)} · CiteScore {matchedJournal.citeScore.toFixed(1)} · APC{' '}
-                                {matchedJournal.apcUsd === 0 ? '$0 Free (Diamond OA)' : `$${matchedJournal.apcUsd.toLocaleString()}`} ·{' '}
-                                {matchedJournal.waiverPolicy}
+                                JIF {fmtNum(matchedJournal.impactFactor)} · CiteScore {fmtNum(matchedJournal.citeScore)} · SJR{' '}
+                                {fmtNum(matchedJournal.sjrScore, 2)} · APC {fmtApc(matchedJournal.apcUsd)}
+                                {matchedJournal.waiverPolicy ? ` · ${matchedJournal.waiverPolicy}` : ''}
                               </div>
                             </div>
 
@@ -1562,7 +1586,7 @@ export default function App() {
                 >
                   {journals.map((j) => (
                     <option key={j.id} value={j.id}>
-                      {j.title} ({j.tier} · JIF {j.impactFactor.toFixed(1)} · CiteScore {j.citeScore.toFixed(1)} · APC ${j.apcUsd})
+                      {j.title} ({j.tier} · JIF {fmtNum(j.impactFactor)} · SJR {fmtNum(j.sjrScore, 2)} · APC {fmtApc(j.apcUsd)})
                     </option>
                   ))}
                 </select>
@@ -1604,47 +1628,55 @@ export default function App() {
                 <div className="mt-1 text-2xl font-bold font-mono tabular-nums text-teal-800 dark:text-teal-400">
                   {selectedJournal.tier}
                 </div>
-                <div className="mt-0.5 text-xs text-slate-500">{selectedJournal.indexing[0]} / Scopus</div>
+                <div className="mt-0.5 text-xs text-slate-500">{selectedJournal.indexing.join(' / ') || 'SJR best quartile'}</div>
               </div>
               <div className="p-4">
                 <div className="text-xs text-slate-500 dark:text-slate-400">Impact Factor (JIF)</div>
                 <div className="mt-1 text-2xl font-bold font-mono tabular-nums text-slate-900 dark:text-slate-100">
-                  {selectedJournal.impactFactor.toFixed(1)}
+                  {fmtNum(selectedJournal.impactFactor)}
                 </div>
-                <div className="mt-0.5 text-xs text-slate-500">5-Year JIF: {selectedJournal.fiveYearImpactFactor.toFixed(1)}</div>
+                <div className="mt-0.5 text-xs text-slate-500">5-Year JIF: {fmtNum(selectedJournal.fiveYearImpactFactor)}</div>
               </div>
               <div className="p-4">
                 <div className="text-xs text-slate-500 dark:text-slate-400">Scopus CiteScore</div>
                 <div className="mt-1 text-2xl font-bold font-mono tabular-nums text-slate-900 dark:text-slate-100">
-                  {selectedJournal.citeScore.toFixed(1)}
+                  {fmtNum(selectedJournal.citeScore)}
                 </div>
-                <div className="mt-0.5 text-xs text-slate-500">Ratio: {(selectedJournal.citeScore / selectedJournal.impactFactor).toFixed(2)}x JIF</div>
+                <div className="mt-0.5 text-xs text-slate-500">
+                  {isKnown(selectedJournal.citeScore) && isKnown(selectedJournal.impactFactor) && selectedJournal.impactFactor > 0
+                    ? `Ratio: ${(selectedJournal.citeScore / selectedJournal.impactFactor).toFixed(2)}x JIF`
+                    : 'Ratio: —'}
+                </div>
               </div>
               <div className="p-4">
                 <div className="text-xs text-slate-500 dark:text-slate-400">SCImago SJR &amp; H-Index</div>
                 <div className="mt-1 text-2xl font-bold font-mono tabular-nums text-slate-900 dark:text-slate-100">
-                  {selectedJournal.sjrScore.toFixed(2)}
+                  {fmtNum(selectedJournal.sjrScore, 2)}
                 </div>
-                <div className="mt-0.5 text-xs text-slate-500">H-Index: {selectedJournal.hIndex}</div>
+                <div className="mt-0.5 text-xs text-slate-500">H-Index: {fmtInt(selectedJournal.hIndex)}</div>
               </div>
               <div className="p-4">
                 <div className="text-xs text-slate-500 dark:text-slate-400">APC &amp; Cost per JIF</div>
                 <div className="mt-1 text-2xl font-bold font-mono tabular-nums text-emerald-700 dark:text-emerald-400">
-                  {selectedJournal.apcUsd === 0 ? '$0' : `$${selectedJournal.apcUsd.toLocaleString()}`}
+                  {isKnown(selectedJournal.apcUsd) ? (selectedJournal.apcUsd === 0 ? '$0' : `$${selectedJournal.apcUsd.toLocaleString()}`) : DASH}
                 </div>
                 <div className="mt-0.5 text-xs text-slate-500">
-                  {selectedJournal.apcUsd === 0
-                    ? 'Free Diamond OA'
-                    : `$${Math.round(selectedJournal.apcUsd / selectedJournal.impactFactor)} / JIF pt`}
+                  {!isKnown(selectedJournal.apcUsd)
+                    ? 'APC not recorded'
+                    : selectedJournal.apcUsd === 0
+                    ? 'No APC'
+                    : isKnown(selectedJournal.impactFactor) && selectedJournal.impactFactor > 0
+                    ? `$${Math.round(selectedJournal.apcUsd / selectedJournal.impactFactor)} / JIF pt`
+                    : 'Cost per JIF: —'}
                 </div>
               </div>
               <div className="p-4">
                 <div className="text-xs text-slate-500 dark:text-slate-400">Editorial Velocity</div>
                 <div className="mt-1 text-2xl font-bold font-mono tabular-nums text-slate-900 dark:text-slate-100">
-                  {selectedJournal.firstDecisionDays}d
+                  {fmtInt(selectedJournal.firstDecisionDays, 'd')}
                 </div>
                 <div className="mt-0.5 text-xs text-slate-500">
-                  {selectedJournal.acceptanceRatePct}% accept · {selectedJournal.publicationTimeDays}d pub
+                  {fmtInt(selectedJournal.acceptanceRatePct, '%')} accept · {fmtInt(selectedJournal.publicationTimeDays, 'd')} pub
                 </div>
               </div>
             </div>
@@ -1672,6 +1704,13 @@ export default function App() {
                   {/* SVG Chart */}
                   {(() => {
                     const history = selectedJournal.impactHistory;
+                    if (history.length < 2) {
+                      return (
+                        <div className="mt-4 h-56 flex items-center justify-center text-sm text-slate-500 dark:text-slate-400 border border-dashed border-slate-200 dark:border-slate-800 rounded-lg">
+                          No multi-year JIF / CiteScore history recorded for this journal.
+                        </div>
+                      );
+                    }
                     const maxVal = Math.max(...history.flatMap((h) => [h.jif, h.citeScore]), 5) * 1.15;
                     const width = 560;
                     const height = 210;
@@ -1798,7 +1837,7 @@ export default function App() {
                   <div className="mt-4 divide-y divide-slate-200 dark:divide-slate-800">
                     {journals
                       .filter((j) => j.subjectPrimary === selectedJournal.subjectPrimary || j.subjects.includes(selectedJournal.subjectPrimary))
-                      .sort((a, b) => b.impactFactor - a.impactFactor)
+                      .sort((a, b) => compareNullable(a.impactFactor ?? a.sjrScore, b.impactFactor ?? b.sjrScore, 'desc'))
                       .slice(0, 6)
                       .map((peer) => {
                         const isCurrent = peer.id === selectedJournal.id;
@@ -1817,15 +1856,15 @@ export default function App() {
                                 {peer.title}
                               </div>
                               <div className="text-[11px] text-slate-500 font-mono">
-                                {peer.tier} · {peer.apcUsd === 0 ? '$0 Free' : `$${peer.apcUsd}`} · {peer.firstDecisionDays}d
+                                {peer.tier} · {fmtApc(peer.apcUsd)} · {fmtInt(peer.firstDecisionDays, 'd')}
                               </div>
                             </div>
                             <div className="text-right font-mono tabular-nums shrink-0">
                               <div className="text-xs font-bold text-teal-800 dark:text-teal-400">
-                                JIF {peer.impactFactor.toFixed(1)}
+                                {isKnown(peer.impactFactor) ? `JIF ${peer.impactFactor.toFixed(1)}` : `SJR ${fmtNum(peer.sjrScore, 2)}`}
                               </div>
                               <div className="text-[11px] text-slate-500">
-                                {peer.acceptanceRatePct}% acc
+                                {fmtInt(peer.acceptanceRatePct, '%')} acc
                               </div>
                             </div>
                           </div>
@@ -1973,7 +2012,7 @@ export default function App() {
                 >
                   {journals.map((j) => (
                     <option key={j.id} value={j.id}>
-                      {j.title} ({j.tier} · {j.guidelines.blindingPolicy} · {j.guidelines.referenceStyle})
+                      {j.title} ({j.tier}{j.guidelines.blindingPolicy ? ` · ${j.guidelines.blindingPolicy}` : ''}{j.guidelines.referenceStyle ? ` · ${j.guidelines.referenceStyle}` : ''})
                     </option>
                   ))}
                 </select>
@@ -1997,15 +2036,17 @@ export default function App() {
                     </>
                   )}
                 </button>
-                <a
-                  href={selectedJournal.guidelines.authorPortalUrl}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="inline-flex items-center gap-1.5 px-4 py-2.5 text-xs font-semibold text-slate-700 dark:text-slate-200 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 rounded-lg transition-colors whitespace-nowrap shrink-0"
-                >
-                  Official Author Instructions
-                  <ExternalLink className="w-3.5 h-3.5" />
-                </a>
+                {selectedJournal.guidelines.authorPortalUrl && (
+                  <a
+                    href={selectedJournal.guidelines.authorPortalUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center gap-1.5 px-4 py-2.5 text-xs font-semibold text-slate-700 dark:text-slate-200 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 rounded-lg transition-colors whitespace-nowrap shrink-0"
+                  >
+                    Official Author Instructions
+                    <ExternalLink className="w-3.5 h-3.5" />
+                  </a>
+                )}
               </div>
             </div>
 
@@ -2014,42 +2055,44 @@ export default function App() {
               <div className="p-4">
                 <div className="text-xs text-slate-500">Abstract Word Limit</div>
                 <div className="mt-1 text-xl font-bold font-mono tabular-nums text-slate-900 dark:text-slate-100">
-                  ≤ {selectedJournal.guidelines.wordLimitAbstract}w
+                  {selectedJournal.guidelines.wordLimitAbstract ? `≤ ${selectedJournal.guidelines.wordLimitAbstract}w` : DASH}
                 </div>
                 <div className="mt-0.5 text-xs text-slate-500">Strict portal cap</div>
               </div>
               <div className="p-4">
                 <div className="text-xs text-slate-500">Reference Limit &amp; Style</div>
                 <div className="mt-1 text-xl font-bold font-mono tabular-nums text-slate-900 dark:text-slate-100">
-                  ≤ {selectedJournal.guidelines.maxReferences} refs
+                  {selectedJournal.guidelines.maxReferences ? `≤ ${selectedJournal.guidelines.maxReferences} refs` : DASH}
                 </div>
-                <div className="mt-0.5 text-xs text-slate-500">{selectedJournal.guidelines.referenceStyle}</div>
+                <div className="mt-0.5 text-xs text-slate-500">{selectedJournal.guidelines.referenceStyle ?? 'Style not recorded'}</div>
               </div>
               <div className="p-4">
                 <div className="text-xs text-slate-500">Tables &amp; Figures Cap</div>
                 <div className="mt-1 text-xl font-bold font-mono tabular-nums text-slate-900 dark:text-slate-100">
-                  {selectedJournal.guidelines.maxTablesFigures} items
+                  {selectedJournal.guidelines.maxTablesFigures ? `${selectedJournal.guidelines.maxTablesFigures} items` : DASH}
                 </div>
                 <div className="mt-0.5 text-xs text-slate-500">Combined main files</div>
               </div>
               <div className="p-4">
                 <div className="text-xs text-slate-500">Peer Review Blinding</div>
                 <div className="mt-1 text-base font-bold text-teal-800 dark:text-teal-400">
-                  {selectedJournal.guidelines.blindingPolicy}
+                  {selectedJournal.guidelines.blindingPolicy ?? DASH}
                 </div>
                 <div className="mt-0.5 text-xs text-slate-500">
                   {selectedJournal.guidelines.blindingPolicy === 'Double-Blind'
                     ? 'Anonymize main text'
-                    : 'Authors visible to reviewers'}
+                    : selectedJournal.guidelines.blindingPolicy
+                    ? 'Authors visible to reviewers'
+                    : 'Not recorded'}
                 </div>
               </div>
               <div className="p-4 col-span-2">
                 <div className="text-xs text-slate-500">Main Manuscript Length</div>
                 <div className="mt-1 text-sm font-bold text-slate-900 dark:text-slate-100">
-                  {selectedJournal.guidelines.wordLimitMainText}
+                  {selectedJournal.guidelines.wordLimitMainText ?? 'Not recorded'}
                 </div>
                 <div className="mt-0.5 text-xs text-slate-500">
-                  Checklists: {selectedJournal.guidelines.reportingStandards.join(' · ')}
+                  Checklists: {selectedJournal.guidelines.reportingStandards.join(' · ') || 'not recorded'}
                 </div>
               </div>
             </div>
@@ -2153,7 +2196,7 @@ export default function App() {
                         Data Availability Mandate
                       </div>
                       <p className="text-slate-600 dark:text-slate-400 leading-relaxed">
-                        {selectedJournal.guidelines.dataSharingPolicy}
+                        {selectedJournal.guidelines.dataSharingPolicy ?? 'Not recorded. Check the journal\'s author guidelines.'}
                       </p>
                     </div>
 
@@ -2162,7 +2205,7 @@ export default function App() {
                         Preprint Policy (medRxiv / bioRxiv / SciELO)
                       </div>
                       <p className="text-slate-600 dark:text-slate-400 leading-relaxed">
-                        {selectedJournal.guidelines.preprintPolicy}
+                        {selectedJournal.guidelines.preprintPolicy ?? 'Not recorded. Check the journal\'s author guidelines.'}
                       </p>
                     </div>
 
@@ -2172,8 +2215,8 @@ export default function App() {
                       </div>
                       <p className="text-slate-600 dark:text-slate-400 leading-relaxed">
                         Published under <strong>{selectedJournal.accessModel}</strong> with list APC of{' '}
-                        <strong>${selectedJournal.apcUsd.toLocaleString()} USD</strong>. Policy:{' '}
-                        <strong>{selectedJournal.waiverPolicy}</strong>. Corresponding authors based in Research4Life Group A (full 100% waiver) or Group B (50% discount) countries should request fee exemption during step 1 of portal submission, never after acceptance.
+                        <strong>{isKnown(selectedJournal.apcUsd) ? `$${selectedJournal.apcUsd.toLocaleString()} USD` : 'unknown'}</strong>. Policy:{' '}
+                        <strong>{selectedJournal.waiverPolicy || 'not recorded'}</strong>. Corresponding authors based in Research4Life Group A (full 100% waiver) or Group B (50% discount) countries should request fee exemption during step 1 of portal submission, never after acceptance.
                       </p>
                     </div>
                   </div>
